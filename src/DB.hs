@@ -29,52 +29,49 @@ pageSize
 
 getPage :: PageMap -> LockMap -> HandleMap -> TableId -> PageId -> IO MemPage
 getPage pageMap lockMap handleMap tableId pageId = do
-  page <- atomically $ do
+  pageOrLock <- atomically $ do
     page <- Map.lookup (tableId, pageId) pageMap
     case page of
       Just page' ->
-        return $ Just page'
+        return $ Left page'
       Nothing -> do
         -- If page not loaded, load from disk. This is
         -- mutually-exclusive per table.
         lock <- Map.lookup tableId lockMap
         case lock of
           Nothing -> do
-            lock <- L.newAcquired
+            lock <- L.new
             Map.insert lock tableId lockMap
-            return Nothing
-          Just lock' -> do
-            L.acquire lock'
-            -- Re-check presence of page in case it's now
-            -- loaded. TODO: can this be skipped in some situations
-            -- with tryAcquire?
-            Map.lookup (tableId, pageId) pageMap
-  case page of
-    Nothing -> do
-      -- Load page from disk
-      -- TODO: handle unlocking table lock on error
-
-      -- Get file handle
-      let
-        getHandle = do
-          handle <- openBinaryFile "TODO" ReadWriteMode
-          atomically $ Map.insert handle tableId handleMap
-          return handle
-      handle' <- atomically $ Map.lookup tableId handleMap
-      handle <- maybe getHandle return handle'
-      hSeek handle AbsoluteSeek . toInteger $ pageSize * pageId
-      page <- B.hGet handle pageSize
-      let
-        memPage
-          = MemPage page False
-      -- TODO: evict once page size reaches limit
-      atomically $ Map.insert memPage (tableId, pageId) pageMap
-    Just page' ->
-      return page'
-
-  -- Check if page is in the page map and return if so
-  -- If not, load page from disk:
-  --   Get table file handle (open if not exists)
-  --   Read from disk
+            return $ Right lock
+          Just lock' ->
+            return $ Right lock'
+  case pageOrLock of
+    Left page ->
+      return page
+    Right lock -> do
+      L.with lock $ do
+        -- Check to see whether page has now been loaded
+        page <- atomically $ Map.lookup (tableId, pageId) pageMap
+        case page of
+          Just page' ->
+            return page'
+          Nothing -> do
+            -- Load page from disk
+            -- Get file handle
+            let
+              getHandle = do
+                handle <- openBinaryFile "test" ReadWriteMode
+                atomically $ Map.insert handle tableId handleMap
+                return handle
+            handle' <- atomically $ Map.lookup tableId handleMap
+            handle <- maybe getHandle return handle'
+            hSeek handle AbsoluteSeek . toInteger $ pageSize * pageId
+            page <- B.hGet handle pageSize
+            let
+              memPage
+                = MemPage page False
+            -- TODO: evict once page size reaches limit
+            atomically $ Map.insert memPage (tableId, pageId) pageMap
+            return $ memPage
 
 f = 1
