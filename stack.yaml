@@ -1,5 +1,5 @@
 resolver: lts-16.11
-packages: 
+packages:
   - '.'
 extra-deps:
   - stm-containers-1.2@sha256:a887f2e7692b7cf20e0b081e2d66e21076e2bd4b57016ec59c484edfa2d29397,3244
