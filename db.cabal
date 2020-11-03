@@ -1,0 +1,15 @@
+name: db
+version: 0.1
+cabal-version: >= 1.2
+build-type: Simple
+
+library
+  build-depends: 
+      base
+    , bytestring == 0.10.*
+    , stm-containers == 1.2.*
+    , concurrent-extra == 0.7.*
+  exposed-modules:
+      DB
+  ghc-options: -W
+  hs-source-dirs: src
