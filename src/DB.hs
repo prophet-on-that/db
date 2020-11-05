@@ -6,7 +6,7 @@ module DB where
 import qualified Data.ByteString as B
 import qualified StmContainers.Map as Map
 import qualified Control.Concurrent.STM.Lock as L
-import GHC.Conc (atomically)
+import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..))
 import Data.Serialize (Serialize, decode)
 import GHC.Generics (Generic)
@@ -16,6 +16,7 @@ import Data.Typeable (Typeable)
 data DBException
   = PageDecodeError TableId PageId String
   | TableHeaderDecodeError TableId String
+  | TableHeaderNotLoaded TableId
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -31,7 +32,7 @@ tableHeaderSize
   = 8
 
 data Page = Page
-  { freeSpace :: Int
+  { usedSpace :: Int -- ^ Used bytes in pageData
   , pageData :: B.ByteString
   } deriving (Show, Generic)
 
@@ -42,8 +43,16 @@ pageSize :: Int
 pageSize
   = 1024
 
-data MemPage = MemPage
-  { page :: Page
+pageDataSize :: Int
+pageDataSize
+  = pageSize - 8
+
+newPage :: Page
+newPage
+  = Page 0 $ B.replicate pageDataSize 0
+
+data MemPage a = MemPage
+  { page :: a
   , isDirty :: Bool
   } deriving (Show)
 
@@ -51,16 +60,17 @@ type TableId = Int
 
 type PageId = Int
 
-type PageMap = Map.Map (TableId, PageId) MemPage
+type PageMap = Map.Map (TableId, PageId) (MemPage Page)
 
 type LockMap = Map.Map TableId L.Lock
 
 type HandleMap = Map.Map TableId Handle
 
-type HeaderMap = Map.Map TableId TableHeader
+type HeaderMap = Map.Map TableId (MemPage TableHeader)
 
 data DB = DB
   { dataDir :: String
+  , tableCounter :: TVar Int
   , pageMap :: PageMap
   , lockMap :: LockMap
   , handleMap :: HandleMap
@@ -70,13 +80,18 @@ data DB = DB
 newDB :: IO DB
 newDB
   = atomically $
-      DB "tmp" <$> Map.new <*> Map.new <*> Map.new <*> Map.new
+          DB "tmp"
+      <$> newTVar 0 -- TODO: should be read from disk
+      <*> Map.new
+      <*> Map.new
+      <*> Map.new
+      <*> Map.new
 
 getTableFileName :: String -> TableId -> String
 getTableFileName dirName tableId
   = dirName ++ "/" ++ show tableId
 
-getPage :: DB -> TableId -> PageId -> IO MemPage
+getPage :: DB -> TableId -> PageId -> IO (MemPage Page)
 getPage DB {..} tableId pageId = do
   pageOrLock <- atomically $ do
     page <- Map.lookup (tableId, pageId) pageMap
@@ -119,7 +134,7 @@ getPage DB {..} tableId pageId = do
                   Right header' -> do
                     atomically $ do
                       Map.insert handle tableId handleMap
-                      Map.insert header' tableId headerMap
+                      Map.insert (MemPage header' False) tableId headerMap
                     return handle
             handle' <- atomically $ Map.lookup tableId handleMap
             handle <- maybe getHandle return handle'
@@ -144,6 +159,25 @@ getPage DB {..} tableId pageId = do
 -- For each page, need to store the amount of free space (and later
 -- position of rows to permit variable-length rows).
 
-createPage :: TableId -> PageMap -> IO MemPage
-createPage tableId pageMap = do
-  undefined
+createTable :: DB -> IO TableId
+createTable DB {..}
+  = atomically $ do
+      tableId <- readTVar tableCounter
+      writeTVar tableCounter $ tableId + 1
+      let
+        header
+          = TableHeader 0
+      Map.insert (MemPage header True) tableId headerMap
+      return tableId
+
+createPage :: DB -> TableId -> IO PageId
+createPage DB {..} tableId
+  = atomically $ do
+      header <- Map.lookup tableId headerMap
+      case header of
+        Nothing ->
+          throwSTM $ TableHeaderNotLoaded tableId
+        Just (MemPage (TableHeader {..}) _) -> do
+          Map.insert (MemPage (TableHeader $ pageCount + 1) True) tableId headerMap
+          Map.insert (MemPage newPage True) (tableId, pageCount) pageMap
+          return pageCount
