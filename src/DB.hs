@@ -56,16 +56,24 @@ type LockMap = Map.Map TableId L.Lock
 
 type HandleMap = Map.Map TableId Handle
 
+type HeaderMap = Map.Map TableId TableHeader
+
 data DB = DB
-  { pageMap :: PageMap
+  { dataDir :: String
+  , pageMap :: PageMap
   , lockMap :: LockMap
   , handleMap :: HandleMap
+  , headerMap :: HeaderMap
   }
 
 newDB :: IO DB
 newDB
   = atomically $
-      DB <$> Map.new <*> Map.new <*> Map.new
+      DB "tmp" <$> Map.new <*> Map.new <*> Map.new <*> Map.new
+
+getTableFileName :: String -> TableId -> String
+getTableFileName dirName tableId
+  = dirName ++ "/" ++ show tableId
 
 getPage :: DB -> TableId -> PageId -> IO MemPage
 getPage DB {..} tableId pageId = do
@@ -100,7 +108,7 @@ getPage DB {..} tableId pageId = do
             -- Get file handle
             let
               getHandle = do
-                handle <- openBinaryFile "test" ReadWriteMode -- TODO: make filename a function of table id
+                handle <- openBinaryFile (getTableFileName dataDir tableId) ReadWriteMode
                 -- TOOD: set buffer mode of handle
                 atomically $ Map.insert handle tableId handleMap
                 return handle
