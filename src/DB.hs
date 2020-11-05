@@ -15,6 +15,7 @@ import Data.Typeable (Typeable)
 
 data DBException
   = PageDecodeError TableId PageId String
+  | TableHeaderDecodeError TableId String
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -107,14 +108,22 @@ getPage DB {..} tableId pageId = do
             -- Load page from disk
             -- Get file handle
             let
+              -- Get handle and load table header
               getHandle = do
                 handle <- openBinaryFile (getTableFileName dataDir tableId) ReadWriteMode
                 -- TOOD: set buffer mode of handle
-                atomically $ Map.insert handle tableId handleMap
-                return handle
+                header <- decode <$> B.hGet handle tableHeaderSize
+                case header of
+                  Left err ->
+                    throw $ TableHeaderDecodeError tableId err
+                  Right header' -> do
+                    atomically $ do
+                      Map.insert handle tableId handleMap
+                      Map.insert header' tableId headerMap
+                    return handle
             handle' <- atomically $ Map.lookup tableId handleMap
             handle <- maybe getHandle return handle'
-            hSeek handle AbsoluteSeek . toInteger $ pageSize * pageId
+            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
             page <- decode <$> B.hGet handle pageSize
             case page of
               Left err ->
