@@ -1,22 +1,25 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections #-}
 
 module DB where
 
 import qualified Data.ByteString as B
 import qualified StmContainers.Map as Map
 import qualified Control.Concurrent.STM.Lock as L
-import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM)
+import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..))
 import Data.Serialize (Serialize, decode)
 import GHC.Generics (Generic)
 import Control.Exception (Exception, throw)
 import Data.Typeable (Typeable)
+import Control.Monad (when)
 
 data DBException
   = PageDecodeError TableId PageId String
   | TableHeaderDecodeError TableId String
-  | TableHeaderNotLoaded TableId
+  | InvalidPageId TableId PageId
+  | TableNotOpen TableId
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -93,7 +96,7 @@ getTableFileName :: String -> TableId -> String
 getTableFileName dirName tableId
   = dirName ++ "/" ++ show tableId
 
--- ^ Open a table and load header. Nothing happens if the table is
+-- Open a table and load header. Nothing happens if the table is
 -- already loaded.
 openTable :: DB -> TableId -> IO TableData
 openTable DB {..} tableId = do
@@ -126,8 +129,8 @@ openTable DB {..} tableId = do
       Just tableData' ->
         return tableData'
 
--- ^ Create a table by opening file handle. Does not write table
--- header to disk.
+-- Create a table by opening file handle. Does not write table header
+-- to disk.
 createTable :: DB -> IO (TableId, TableData)
 createTable DB {..} = do
   (tableId, lock) <- atomically $ do
@@ -150,65 +153,59 @@ createTable DB {..} = do
     atomically $ Map.insert tableData tableId tableMap
     return (tableId, tableData)
 
--- getPage :: DB -> TableId -> PageId -> IO (MemPage Page)
--- getPage DB {..} tableId pageId = do
---   pageOrLock <- atomically $ do
---     page <- Map.lookup (tableId, pageId) pageMap
---     case page of
---       Just page' ->
---         return $ Left page'
---       Nothing -> do
---         -- If page not loaded, load from disk. This is
---         -- mutually-exclusive per table.
---         lock <- Map.lookup tableId lockMap
---         case lock of
---           Nothing -> do
---             lock <- L.new
---             Map.insert lock tableId lockMap
---             return $ Right lock
---           Just lock' ->
---             return $ Right lock'
---   case pageOrLock of
---     Left page ->
---       return page
---     Right lock -> do
---       L.with lock $ do
---         -- Check to see whether page has now been loaded
---         page <- atomically $ Map.lookup (tableId, pageId) pageMap
---         case page of
---           Just page' ->
---             return page'
---           Nothing -> do
---             -- Load page from disk
---             -- Get file handle
---             let
---               -- Get handle and load table header
---               getHandle = do
---                 handle <- openBinaryFile (getTableFileName dataDir tableId) ReadWriteMode
---                 -- TOOD: set buffer mode of handle
---                 header <- decode <$> B.hGet handle tableHeaderSize
---                 case header of
---                   Left err ->
---                     throw $ TableHeaderDecodeError tableId err
---                   Right header' -> do
---                     atomically $ do
---                       Map.insert handle tableId handleMap
---                       Map.insert (MemPage header' False) tableId headerMap
---                     return handle
---             handle' <- atomically $ Map.lookup tableId handleMap
---             handle <- maybe getHandle return handle'
---             hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
---             page <- decode <$> B.hGet handle pageSize
---             case page of
---               Left err ->
---                 throw $ PageDecodeError tableId pageId err
---               Right page' -> do
---                 -- TODO: evict once page size reaches limit
---                 let
---                   memPage
---                     = MemPage page' False
---                 atomically $ Map.insert memPage (tableId, pageId) pageMap
---                 return memPage
+-- Load a table page into memory. Throws a 'TableNotOpen' exception if
+-- the table is not open.
+loadPage :: DB -> TableId -> PageId -> IO Page
+loadPage DB {..} tableId pageId = do
+  pageOrLock <- atomically $ do
+    page <- Map.lookup (tableId, pageId) pageMap
+    case page of
+      Just page' ->
+        return $ Left page'
+      Nothing -> do
+        -- If page not loaded, load from disk. This is
+        -- mutually-exclusive per table.
+        lock <- Map.lookup tableId lockMap
+        maybe (throwSTM $ TableNotOpen tableId) (return . Right) lock
+  case pageOrLock of
+    Left MemPage {..} ->
+      return page
+    Right lock -> do
+      L.with lock $ do
+        -- Check to see whether page has now been loaded
+        (page, TableData {..}) <- atomically $ do
+          page <- Map.lookup (tableId, pageId) pageMap
+          tableData <- Map.lookup tableId tableMap
+          maybe (throwSTM $ TableNotOpen tableId) (return . (page,)) tableData
+        case page of
+          Just MemPage {..} ->
+            return page
+          Nothing -> do
+            -- NOTE: this page count check does not guarantee a valid
+            -- load, because some pages may exist in the page map but
+            -- have not yet been stored to disk.
+            when (pageCount tableHeader < pageId) $
+              throw $ InvalidPageId tableId pageId
+            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
+            page <- decode <$> B.hGet handle pageSize >>= either (throw . PageDecodeError tableId pageId) return
+            -- TODO: evict once page size reaches map limit
+            let
+              memPage
+                = MemPage page False
+            atomically $ Map.insert memPage (tableId, pageId) pageMap
+            return page
+
+createPage :: DB -> TableId -> STM PageId
+createPage DB {..} tableId = do
+  tableData@TableData {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
+  let
+    pageId
+      = pageCount tableHeader
+    updatedTableData
+      = tableData {tableHeader = TableHeader $ pageId + 1}
+  Map.insert updatedTableData tableId tableMap
+  Map.insert (MemPage newPage True) (tableId, pageId) pageMap
+  return pageId
 
 -- -- For a table, we need to know how any pages are currently stored in
 -- -- the table. Store this in the table header, which is loaded when the
