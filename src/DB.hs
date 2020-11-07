@@ -9,7 +9,7 @@ import qualified StmContainers.Map as Map
 import qualified Control.Concurrent.STM.Lock as L
 import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush)
-import Data.Serialize (Serialize, decode, encode)
+import Data.Serialize (Serialize (..), decode, encode, putByteString, getBytes)
 import GHC.Generics (Generic)
 import Control.Exception (Exception, throw)
 import Data.Typeable (Typeable)
@@ -48,16 +48,30 @@ data Page = Page
   , pageData :: B.ByteString
   } deriving (Show, Generic)
 
-instance Serialize Page
+-- We need to provide a custom Serialize instance as the default
+-- bytestring serialiser first encodes the length, which we don't
+-- need.
+instance Serialize Page where
+  put Page {..} = do
+    put usedSpace
+    putByteString pageData
+
+  get = do
+    usedSpace <- get
+    pageData <- getBytes pageDataSize
+    return Page {..}
 
 -- ^ The size of a table page in bytes, including its header
 pageSize :: Int
 pageSize
   = 1024
 
+pageHeaderSize
+  = 8
+
 pageDataSize :: Int
 pageDataSize
-  = pageSize - 8
+  = pageSize - pageHeaderSize
 
 newPage :: Page
 newPage
@@ -89,7 +103,7 @@ data DB = DB
 newDB :: IO DB
 newDB
   = atomically $
-          DB "tmp"
+          DB "tmp"              -- NOTE: this directory must already exist!
       <$> newTVar 0 -- TODO: should be read from disk
       <*> Map.new
       <*> Map.new
