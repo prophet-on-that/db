@@ -8,12 +8,15 @@ import qualified Data.ByteString as B
 import qualified StmContainers.Map as Map
 import qualified Control.Concurrent.STM.Lock as L
 import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
-import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..))
-import Data.Serialize (Serialize, decode)
+import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush)
+import Data.Serialize (Serialize, decode, encode)
 import GHC.Generics (Generic)
 import Control.Exception (Exception, throw)
 import Data.Typeable (Typeable)
-import Control.Monad (when)
+import Control.Monad (when, forM_)
+import ListT (toReverseList)
+import Data.List (sortBy, groupBy)
+import Data.Ord (comparing)
 
 data DBException
   = PageDecodeError TableId PageId String
@@ -207,22 +210,39 @@ createPage DB {..} tableId = do
   Map.insert (MemPage newPage True) (tableId, pageId) pageMap
   return pageId
 
--- -- For a table, we need to know how any pages are currently stored in
--- -- the table. Store this in the table header, which is loaded when the
--- -- table is first opened (when handler acquired). This can then be
--- -- consulted/modified when adding a page to a table.
-
--- -- For each page, need to store the amount of free space (and later
--- -- position of rows to permit variable-length rows).
-
--- createPage :: DB -> TableId -> IO PageId
--- createPage DB {..} tableId
---   = atomically $ do
---       header <- Map.lookup tableId headerMap
---       case header of
---         Nothing ->
---           throwSTM $ TableHeaderNotLoaded tableId
---         Just (MemPage (TableHeader {..}) _) -> do
---           Map.insert (MemPage (TableHeader $ pageCount + 1) True) tableId headerMap
---           Map.insert (MemPage newPage True) (tableId, pageCount) pageMap
---           return pageCount
+flushPages :: DB -> IO ()
+flushPages DB {..} = do
+  pagesToFlush <- atomically $ do
+    pagesToFlush <- fmap (filter $ isDirty . snd) . toReverseList . Map.listT $ pageMap
+    -- Mark all affected pages as written
+    forM_ pagesToFlush $ \(tableAndPageId, memPage) ->
+      Map.insert (memPage {isDirty = False}) tableAndPageId pageMap
+    return pagesToFlush
+  let
+    -- TODO: there must be a better way to write this
+    areEqualTables a b
+      = (fst . fst) a == (fst . fst) b
+    groupedPages
+      = groupBy areEqualTables . sortBy (comparing fst) $ pagesToFlush
+  forM_ groupedPages $ \pages -> do
+    let
+      tableId
+        = fst . fst . head $ pages
+    (lock, TableData {..}, writeTableHeader) <- atomically $ do
+      lock <- Map.lookup tableId lockMap >>= maybe (throwSTM $ TableNotOpen tableId) return
+      tableData <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
+      if dirtyHeader tableData
+        then do
+          Map.insert (tableData {dirtyHeader = False}) tableId tableMap
+          return (lock, tableData, True)
+        else
+          return (lock, tableData, False)
+    -- TODO: unmark pages (and table header if necessary) on exception
+    L.with lock $ do
+      when writeTableHeader $ do
+        hSeek handle AbsoluteSeek 0
+        B.hPut handle (encode tableHeader)
+      forM_ pages $ \((_, pageId), MemPage {..}) -> do
+        hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
+        B.hPut handle (encode page)
+      hFlush handle

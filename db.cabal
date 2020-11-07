@@ -10,6 +10,7 @@ library
     , stm-containers == 1.2.*
     , concurrent-extra == 0.7.*
     , cereal == 0.5.*
+    , list-t == 1.0.*
   exposed-modules:
       DB
   ghc-options: -W
