@@ -11,6 +11,7 @@ library
     , concurrent-extra == 0.7.*
     , cereal == 0.5.*
     , list-t == 1.0.*
+    , focus == 1.0.*
   exposed-modules:
       DB
   ghc-options: -W

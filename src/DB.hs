@@ -8,15 +8,17 @@ import qualified Data.ByteString as B
 import qualified StmContainers.Map as Map
 import qualified Control.Concurrent.STM.Lock as L
 import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
-import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush)
+import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush, hClose)
 import Data.Serialize (Serialize (..), decode, encode, putByteString, getBytes)
 import GHC.Generics (Generic)
 import Control.Exception (Exception, throw)
 import Data.Typeable (Typeable)
-import Control.Monad (when, forM_)
+import Control.Monad (when, forM_, forM)
 import ListT (toReverseList)
 import Data.List (sortBy, groupBy)
 import Data.Ord (comparing)
+import Focus (lookupAndDelete)
+import Data.Maybe (catMaybes)
 
 data DBException
   = PageDecodeError TableId PageId String
@@ -108,6 +110,20 @@ newDB
       <*> Map.new
       <*> Map.new
       <*> Map.new
+
+closeDB :: DB -> IO ()
+closeDB db@DB {..} = do
+  -- TODO: close open connections to the DB (once implemented)
+  flushPages db
+  -- Close file handles
+  handles <- atomically $ do
+    locks <- toReverseList . Map.listT $ lockMap
+    fmap catMaybes . forM locks $ \(tableId, _) -> do
+      Map.delete tableId lockMap
+      fmap handle <$> Map.focus lookupAndDelete tableId tableMap
+  -- NOTE: we assume there are no open connections so it is safe to
+  -- close handles without obtaining locks.
+  forM_ handles hClose
 
 getTableFileName :: String -> TableId -> String
 getTableFileName dirName tableId
