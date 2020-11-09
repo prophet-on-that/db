@@ -15,5 +15,10 @@ library
   exposed-modules:
       DB
     , Field
+    , Page
   ghc-options: -W
   hs-source-dirs: src
+  extensions:
+      RecordWildCards
+    , DeriveGeneric
+    , TupleSections
