@@ -14,5 +14,6 @@ library
     , focus == 1.0.*
   exposed-modules:
       DB
+    , Field
   ghc-options: -W
   hs-source-dirs: src

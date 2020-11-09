@@ -1,7 +1,6 @@
 module Field where
 
-import Data.Serialize (Get, encode, Serialize (..), Putter)
-import qualified Data.ByteString as B
+import Data.Serialize (Get, Serialize (..), Putter)
 import Data.Int (Int32)
 
 data Field
@@ -30,10 +29,10 @@ fieldTypeSize FieldTypeBool
 fieldTypeSize FieldTypeInt32
   = 4
 
-decodeField :: FieldType -> Get Field
-decodeField FieldTypeBool
+getField :: FieldType -> Get Field
+getField FieldTypeBool
   = FieldBool <$> get
-decodeField FieldTypeInt32
+getField FieldTypeInt32
   = FieldInt32 <$> get
 
 type FieldSpec = [FieldType]
