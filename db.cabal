@@ -22,3 +22,4 @@ library
       RecordWildCards
     , DeriveGeneric
     , TupleSections
+    , ScopedTypeVariables

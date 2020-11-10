@@ -2,6 +2,7 @@ module Field where
 
 import Data.Serialize (Get, Serialize (..), Putter)
 import Data.Int (Int32)
+import GHC.Generics (Generic)
 
 data Field
   = FieldBool Bool
@@ -20,7 +21,9 @@ putField (FieldInt32 n)
 data FieldType
   = FieldTypeBool
   | FieldTypeInt32
-  deriving (Show)
+  deriving (Show, Generic)
+
+instance Serialize FieldType
 
 -- Byte size of each field
 fieldTypeSize :: FieldType -> Int

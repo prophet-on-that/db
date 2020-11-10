@@ -5,7 +5,7 @@ import qualified StmContainers.Map as Map
 import qualified Control.Concurrent.STM.Lock as L
 import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush, hClose)
-import Data.Serialize (Serialize (..), decode, encode)
+import Data.Serialize (Serialize (..), decode, encode, runGet, runPut)
 import GHC.Generics (Generic)
 import Control.Exception (Exception, throw)
 import Data.Typeable (Typeable)
@@ -15,13 +15,16 @@ import Data.List (sortBy, groupBy)
 import Data.Ord (comparing)
 import Focus (lookupAndDelete)
 import Data.Maybe (catMaybes)
-import Page (Page, newPage, pageSize)
+import Page (Page, newPage, pageSize, getPage, putPage)
+import Field (FieldSpec)
 
 data DBException
   = PageDecodeError TableId PageId String
   | TableHeaderDecodeError TableId String
   | InvalidPageId TableId PageId
   | TableNotOpen TableId
+  | MissingFieldSpec TableId
+  | DBInitError FilePath
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -57,27 +60,55 @@ type LockMap = Map.Map TableId L.Lock
 
 type TableMap = Map.Map TableId TableData
 
+type FieldSpecMap = Map.Map TableId FieldSpec
+
 data DB = DB
-  { dataDir :: String
+  { dataDir :: FilePath
   , tableCounter :: TVar Int
+  , tableCounterHasChanged :: TVar Bool
   , pageMap :: PageMap
   , lockMap :: LockMap
   , tableMap :: TableMap
+  , fieldSpecMap :: FieldSpecMap
+  , fieldSpecMapHasChanged :: TVar Bool
   }
 
-newDB :: IO DB
+defaultDataDir
+  = "tmp"
+
 newDB
+  :: FilePath -- ^ NOTE: this directory must exist!
+  -> IO DB
+newDB dataDir
   = atomically $
-          DB "tmp"              -- NOTE: this directory must already exist!
-      <$> newTVar 0 -- TODO: should be read from disk
+          DB dataDir
+      <$> newTVar 0
+      <*> newTVar False
       <*> Map.new
       <*> Map.new
       <*> Map.new
+      <*> Map.new
+      <*> newTVar False
+
+loadDB :: FilePath -> IO DB
+loadDB dataDir = do
+  let
+    tableCounterFile
+      = tableCounterFileName dataDir
+    fieldSpecMapFile
+      = fieldSpecMapFileName dataDir
+  tableCounter <- B.readFile tableCounterFile >>= either (throw $ DBInitError tableCounterFile) return . decode
+  fieldSpecList :: [(TableId, FieldSpec)] <- B.readFile fieldSpecMapFile >>= either (throw $ DBInitError fieldSpecMapFile) return . decode
+  atomically $ do
+    fieldSpecMap <- Map.new
+    forM_ fieldSpecList $ \(tableId, fieldSpec) ->
+      Map.insert fieldSpec tableId fieldSpecMap
+    DB dataDir <$> newTVar tableCounter <*> newTVar False <*> Map.new <*> Map.new <*> Map.new <*> return fieldSpecMap <*> newTVar False
 
 closeDB :: DB -> IO ()
 closeDB db@DB {..} = do
   -- TODO: close open connections to the DB (once implemented)
-  flushPages db
+  flushDB db
   -- Close file handles
   handles <- atomically $ do
     locks <- toReverseList . Map.listT $ lockMap
@@ -127,11 +158,14 @@ openTable DB {..} tableId = do
 
 -- Create a table by opening file handle. Does not write table header
 -- to disk.
-createTable :: DB -> IO (TableId, TableData)
-createTable DB {..} = do
+createTable :: DB -> FieldSpec -> IO (TableId, TableData)
+createTable DB {..} fieldSpec = do
   (tableId, lock) <- atomically $ do
     tableId <- readTVar tableCounter
     writeTVar tableCounter $ tableId + 1
+    writeTVar tableCounterHasChanged True
+    Map.insert fieldSpec tableId fieldSpecMap
+    writeTVar fieldSpecMapHasChanged True
     -- Create lock
     lock <- L.new
     Map.insert lock tableId lockMap
@@ -169,10 +203,11 @@ loadPage DB {..} tableId pageId = do
     Right lock -> do
       L.with lock $ do
         -- Check to see whether page has now been loaded
-        (page, TableData {..}) <- atomically $ do
+        (page, TableData {..}, fieldSpec) <- atomically $ do
           page <- Map.lookup (tableId, pageId) pageMap
-          tableData <- Map.lookup tableId tableMap
-          maybe (throwSTM $ TableNotOpen tableId) (return . (page,)) tableData
+          tableData <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
+          fieldSpec <- Map.lookup tableId fieldSpecMap >>= maybe (throwSTM $ MissingFieldSpec tableId) return
+          return (page, tableData, fieldSpec)
         case page of
           Just MemPage {..} ->
             return page
@@ -180,11 +215,10 @@ loadPage DB {..} tableId pageId = do
             -- NOTE: this page count check does not guarantee a valid
             -- load, because some pages may exist in the page map but
             -- have not yet been stored to disk.
-            when (pageCount tableHeader < pageId) $
+            when (pageId < 0 || pageCount tableHeader <= pageId) $
               throw $ InvalidPageId tableId pageId
             hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
-            -- page <- decode <$> B.hGet handle pageSize >>= either (throw . PageDecodeError tableId pageId) return
-            page <- return newPage
+            page <- runGet (getPage fieldSpec) <$> B.hGet handle pageSize >>= either (throw . PageDecodeError tableId pageId) return
             -- TODO: evict once page size reaches map limit
             let
               memPage
@@ -204,39 +238,76 @@ createPage DB {..} tableId = do
   Map.insert (MemPage newPage True) (tableId, pageId) pageMap
   return pageId
 
-flushPages :: DB -> IO ()
-flushPages DB {..} = do
-  pagesToFlush <- atomically $ do
+tableCounterFileName
+  = (++ "/tableCounter")
+
+fieldSpecMapFileName
+  = (++ "/fieldSpecMap")
+
+flushDB :: DB -> IO ()
+flushDB DB {..} = do
+  (pagesToFlush, tableCounter', fieldSpecMap') <- atomically $ do
     pagesToFlush <- fmap (filter $ isDirty . snd) . toReverseList . Map.listT $ pageMap
     -- Mark all affected pages as written
     forM_ pagesToFlush $ \(tableAndPageId, memPage) ->
       Map.insert (memPage {isDirty = False}) tableAndPageId pageMap
-    return pagesToFlush
-  let
-    -- TODO: there must be a better way to write this
-    areEqualTables a b
-      = (fst . fst) a == (fst . fst) b
-    groupedPages
-      = groupBy areEqualTables . sortBy (comparing fst) $ pagesToFlush
-  forM_ groupedPages $ \pages -> do
-    let
-      tableId
-        = fst . fst . head $ pages
-    (lock, TableData {..}, writeTableHeader) <- atomically $ do
-      lock <- Map.lookup tableId lockMap >>= maybe (throwSTM $ TableNotOpen tableId) return
-      tableData <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
-      if dirtyHeader tableData
-        then do
-          Map.insert (tableData {dirtyHeader = False}) tableId tableMap
-          return (lock, tableData, True)
-        else
-          return (lock, tableData, False)
-    -- TODO: unmark pages (and table header if necessary) on exception
-    L.with lock $ do
-      when writeTableHeader $ do
-        hSeek handle AbsoluteSeek 0
-        B.hPut handle (encode tableHeader)
-      forM_ pages $ \((_, pageId), MemPage {..}) -> do
-        hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
-        -- B.hPut handle (encode page)
-      hFlush handle
+
+    flushTableCounter <- readTVar tableCounterHasChanged
+    tableCounter' <- if flushTableCounter
+      then do
+        writeTVar tableCounterHasChanged False
+        Just <$> readTVar tableCounter
+      else
+        return Nothing
+
+    flushFieldSpecMap <- readTVar fieldSpecMapHasChanged
+    fieldSpecMap' <- if flushFieldSpecMap
+      then do
+        writeTVar fieldSpecMapHasChanged False
+        fmap Just . toReverseList . Map.listT $  fieldSpecMap
+      else
+        return Nothing
+
+    return (pagesToFlush, tableCounter', fieldSpecMap')
+
+  flushPages pagesToFlush
+  -- TODO: the following operations should be locked to not execute
+  -- concurrently
+  maybe (return ()) flushTableCounter tableCounter'
+  maybe (return ()) flushFieldSpecMap fieldSpecMap'
+  where
+    flushPages pagesToFlush = do
+      let
+        -- TODO: there must be a better way to write this
+        areEqualTables a b
+          = (fst . fst) a == (fst . fst) b
+        groupedPages
+          = groupBy areEqualTables . sortBy (comparing fst) $ pagesToFlush
+      forM_ groupedPages $ \pages -> do
+        let
+          tableId
+            = fst . fst . head $ pages
+        (lock, TableData {..}, writeTableHeader) <- atomically $ do
+          lock <- Map.lookup tableId lockMap >>= maybe (throwSTM $ TableNotOpen tableId) return
+          tableData <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
+          if dirtyHeader tableData
+            then do
+              Map.insert (tableData {dirtyHeader = False}) tableId tableMap
+              return (lock, tableData, True)
+            else
+              return (lock, tableData, False)
+        -- TODO: unmark pages (and table header if necessary) on exception
+        L.with lock $ do
+          when writeTableHeader $ do
+            hSeek handle AbsoluteSeek 0
+            B.hPut handle (encode tableHeader)
+          forM_ pages $ \((_, pageId), MemPage {..}) -> do
+            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
+            B.hPut handle . runPut . putPage $ page
+          hFlush handle
+
+    flushTableCounter
+      = B.writeFile (tableCounterFileName dataDir) . encode
+
+    flushFieldSpecMap
+      = B.writeFile (fieldSpecMapFileName dataDir) . encode
