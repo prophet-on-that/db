@@ -45,8 +45,8 @@ data TableData = TableData
   , handle :: Handle
   }
 
-data MemPage a = MemPage
-  { page :: a
+data MemPage = MemPage
+  { page :: Page
   , isDirty :: Bool
   } deriving (Show)
 
@@ -54,7 +54,7 @@ type TableId = Int
 
 type PageId = Int
 
-type PageMap = Map.Map (TableId, PageId) (MemPage Page)
+type PageMap = Map.Map (TableId, PageId) MemPage
 
 type LockMap = Map.Map TableId L.Lock
 
@@ -183,12 +183,17 @@ createTable DB {..} fieldSpec = do
     atomically $ Map.insert tableData tableId tableMap
     return (tableId, tableData)
 
--- Load a table page into memory. Throws a 'TableNotOpen' exception if
--- the table is not open.
-loadPage :: DB -> TableId -> PageId -> IO Page
-loadPage DB {..} tableId pageId = do
+-- Alter a page, loading it into memory if not already present. Throws
+-- a 'TableNotOpen' exception if the table is not open.
+alterPage
+  :: DB
+  -> TableId
+  -> PageId
+  -> (MemPage -> MemPage) -- ^ Function to modify page
+  -> IO MemPage -- ^ Returns the modified page
+alterPage DB {..} tableId pageId alter = do
   pageOrLock <- atomically $ do
-    page <- Map.lookup (tableId, pageId) pageMap
+    page <- alterPage
     case page of
       Just page' ->
         return $ Left page'
@@ -198,19 +203,19 @@ loadPage DB {..} tableId pageId = do
         lock <- Map.lookup tableId lockMap
         maybe (throwSTM $ TableNotOpen tableId) (return . Right) lock
   case pageOrLock of
-    Left MemPage {..} ->
-      return page
+    Left page' ->
+      return page'
     Right lock -> do
       L.with lock $ do
         -- Check to see whether page has now been loaded
         (page, TableData {..}, fieldSpec) <- atomically $ do
-          page <- Map.lookup (tableId, pageId) pageMap
+          page <- alterPage
           tableData <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
           fieldSpec <- Map.lookup tableId fieldSpecMap >>= maybe (throwSTM $ MissingFieldSpec tableId) return
           return (page, tableData, fieldSpec)
         case page of
-          Just MemPage {..} ->
-            return page
+          Just page' ->
+            return page'
           Nothing -> do
             -- NOTE: this page count check does not guarantee a valid
             -- load, because some pages may exist in the page map but
@@ -222,9 +227,22 @@ loadPage DB {..} tableId pageId = do
             -- TODO: evict once page size reaches map limit
             let
               memPage
-                = MemPage page False
+                = alter $ MemPage page False
             atomically $ Map.insert memPage (tableId, pageId) pageMap
-            return page
+            return memPage
+  where
+    alterPage :: STM (Maybe MemPage)
+    alterPage = do
+      page <- Map.lookup (tableId, pageId) pageMap
+      case page of
+        Just page' -> do
+          let
+            newPage
+              = alter page'
+          Map.insert newPage (tableId, pageId) pageMap
+          return $ Just newPage
+        Nothing ->
+          return Nothing
 
 createPage :: DB -> TableId -> STM PageId
 createPage DB {..} tableId = do
