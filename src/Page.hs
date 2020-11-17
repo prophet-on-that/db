@@ -7,31 +7,24 @@ import Field (Field, FieldSpec, getField, fieldSpecSize, putField)
 import Data.Int (Int32)
 
 data Row = Row
-  { tminCommitted :: Bool
-  , tmin :: Int32
-  , tmaxCommitted :: Bool
-  , tmax :: Int32
+  { tmin :: Int32
+  , tmax :: Maybe Int32 -- TODO: change serialisation logic
   , fields :: [Field]
   } deriving (Show)
 
 rowSize :: FieldSpec -> Int
 rowSize
-  -- TODO: use less space to store row data
-  = (10 +) . fieldSpecSize
+  = (8 +) . fieldSpecSize
 
 getRow :: FieldSpec -> Get Row
 getRow fieldSpec
   = Row <$> get
         <*> get
-        <*> get
-        <*> get
         <*> mapM getField fieldSpec
 
 putRow :: Putter Row
 putRow Row {..} = do
-  put tminCommitted
   put tmin
-  put tmaxCommitted
   put tmax
   mapM_ putField fields
 

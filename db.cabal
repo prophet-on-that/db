@@ -12,6 +12,7 @@ library
     , cereal == 0.5.*
     , list-t == 1.0.*
     , focus == 1.0.*
+    , containers == 0.6.*
   exposed-modules:
       DB
     , Field

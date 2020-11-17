@@ -15,7 +15,10 @@ import Data.List (sortBy, groupBy)
 import Data.Ord (comparing)
 import Focus (lookupAndDelete)
 import Data.Maybe (catMaybes)
-import Page (Page, newPage, pageSize, getPage, putPage)
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Int (Int32)
+import Page (Page (..), Row (..), newPage, pageSize, getPage, putPage)
 import Field (FieldSpec)
 
 data DBException
@@ -25,6 +28,7 @@ data DBException
   | TableNotOpen TableId
   | MissingFieldSpec TableId
   | DBInitError FilePath
+  | InvalidTx TxId
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -62,15 +66,29 @@ type TableMap = Map.Map TableId TableData
 
 type FieldSpecMap = Map.Map TableId FieldSpec
 
+type TxId = Int32
+
+data Tx = Tx
+  { writtenPages :: Set (TableId, PageId)
+  } deriving (Show)
+
+newTx :: Tx
+newTx
+  = Tx Set.empty
+
+type TxMap = Map.Map TxId Tx
+
 data DB = DB
   { dataDir :: FilePath
-  , tableCounter :: TVar Int
+  , tableCounter :: TVar TableId
   , tableCounterHasChanged :: TVar Bool
   , pageMap :: PageMap
   , lockMap :: LockMap
   , tableMap :: TableMap
   , fieldSpecMap :: FieldSpecMap
   , fieldSpecMapHasChanged :: TVar Bool
+  , txCounter :: TVar TxId
+  , txMap :: TxMap
   }
 
 defaultDataDir
@@ -89,6 +107,8 @@ newDB dataDir
       <*> Map.new
       <*> Map.new
       <*> newTVar False
+      <*> newTVar 0
+      <*> Map.new
 
 loadDB :: FilePath -> IO DB
 loadDB dataDir = do
@@ -99,15 +119,16 @@ loadDB dataDir = do
       = fieldSpecMapFileName dataDir
   tableCounter <- B.readFile tableCounterFile >>= either (throw $ DBInitError tableCounterFile) return . decode
   fieldSpecList :: [(TableId, FieldSpec)] <- B.readFile fieldSpecMapFile >>= either (throw $ DBInitError fieldSpecMapFile) return . decode
+  -- ^ TODO: load tx counter
   atomically $ do
     fieldSpecMap <- Map.new
     forM_ fieldSpecList $ \(tableId, fieldSpec) ->
       Map.insert fieldSpec tableId fieldSpecMap
-    DB dataDir <$> newTVar tableCounter <*> newTVar False <*> Map.new <*> Map.new <*> Map.new <*> return fieldSpecMap <*> newTVar False
+    DB dataDir <$> newTVar tableCounter <*> newTVar False <*> Map.new <*> Map.new <*> Map.new <*> return fieldSpecMap <*> newTVar False <*> newTVar 0 <*> Map.new
 
 closeDB :: DB -> IO ()
 closeDB db@DB {..} = do
-  -- TODO: close open connections to the DB (once implemented)
+  -- TODO: rollback outstanding transactions
   flushDB db
   -- Close file handles
   handles <- atomically $ do
@@ -193,7 +214,7 @@ alterPage
   -> IO MemPage -- ^ Returns the modified page
 alterPage DB {..} tableId pageId alter = do
   pageOrLock <- atomically $ do
-    page <- alterPage
+    page <- alterPage'
     case page of
       Just page' ->
         return $ Left page'
@@ -209,7 +230,7 @@ alterPage DB {..} tableId pageId alter = do
       L.with lock $ do
         -- Check to see whether page has now been loaded
         (page, TableData {..}, fieldSpec) <- atomically $ do
-          page <- alterPage
+          page <- alterPage'
           tableData <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
           fieldSpec <- Map.lookup tableId fieldSpecMap >>= maybe (throwSTM $ MissingFieldSpec tableId) return
           return (page, tableData, fieldSpec)
@@ -231,8 +252,8 @@ alterPage DB {..} tableId pageId alter = do
             atomically $ Map.insert memPage (tableId, pageId) pageMap
             return memPage
   where
-    alterPage :: STM (Maybe MemPage)
-    alterPage = do
+    alterPage' :: STM (Maybe MemPage)
+    alterPage' = do
       page <- Map.lookup (tableId, pageId) pageMap
       case page of
         Just page' -> do
@@ -264,6 +285,7 @@ fieldSpecMapFileName
 
 flushDB :: DB -> IO ()
 flushDB DB {..} = do
+  -- TODO: write tx counter
   (pagesToFlush, tableCounter', fieldSpecMap') <- atomically $ do
     pagesToFlush <- fmap (filter $ isDirty . snd) . toReverseList . Map.listT $ pageMap
     -- Mark all affected pages as written
@@ -329,3 +351,59 @@ flushDB DB {..} = do
 
     flushFieldSpecMap
       = B.writeFile (fieldSpecMapFileName dataDir) . encode
+
+beginTx :: DB -> STM TxId
+beginTx DB {..} = do
+  txId <- readTVar txCounter
+  writeTVar txCounter (txId + 1)
+  Map.insert newTx txId txMap
+  return txId
+
+commitTx :: DB -> TxId -> STM ()
+commitTx DB {..} txId
+  = Map.delete txId txMap
+
+-- Undo all modifications by the transaction by looking at all pages
+-- touched by it
+--   - If a row has tMax = tx and tMin != tx then remove tMax
+--   - If a row has tMin = tx then set tMax = tx (effectively deleting
+--     it)
+rollbackTx :: DB -> TxId -> IO ()
+rollbackTx db@DB {..} txId = do
+  Tx {..} <- atomically $ Map.lookup txId txMap >>= maybe (throwSTM $ InvalidTx txId) return
+  -- TODO: update first those pages in memory, to avoid page table
+  -- churn
+  forM_ (Set.toList writtenPages) $ \(tableId, pageId) -> do
+    alterPage db tableId pageId rollbackPage
+  where
+    rollbackPage (MemPage Page {..} isDirty)
+      = MemPage (Page pageHeader rows') (pageModified || isDirty)
+      where
+        (rows', pageModified)
+          = foldr helper ([], False) rows
+
+        helper row@Row {..} (rows, pageModified)
+          | tmax == Just txId && tmin /= txId
+              = (row { tmax = Nothing } : rows, True)
+          | tmin == txId && tmax /= Just txId
+              = (row { tmax = Just txId } : rows, True)
+          | otherwise
+              = (row : rows, pageModified)
+
+-- -- Scan table, returning rows visible to the current transaction
+-- scanTable :: DB -> TxId -> TableId -> IO [Row]
+-- scanTable
+--   = undefined
+
+-- -- Visit pages, starting with those in memory, writing rows to free
+-- -- space in pages. When filter function provided, scan page and mark
+-- -- as deleted any rows matching j
+-- updateTable
+--   :: DB
+--   -> TxId
+--   -> TableId
+--   -> ? -- ^ Rows to insert
+--   -> ? -- ^ Optional filter function to work out whether rows should be deleted
+--   -> IO ()
+-- updateTable
+--   = undefined
