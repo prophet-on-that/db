@@ -17,8 +17,8 @@ import Focus (lookupAndDelete)
 import Data.Maybe (catMaybes)
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Int (Int32)
-import Page (Page (..), Row (..), newPage, pageSize, getPage, putPage)
+import Data.Word (Word16, Word32)
+import Page (Page (..), Row (..), newPage, pageSize, getPage, putPage, TxId, txIdMin)
 import Field (FieldSpec)
 
 data DBException
@@ -34,7 +34,7 @@ data DBException
 instance Exception DBException
 
 data TableHeader = TableHeader
-  { pageCount :: Int
+  { pageCount :: PageId
   } deriving (Show, Generic)
 
 instance Serialize TableHeader
@@ -54,9 +54,9 @@ data MemPage = MemPage
   , isDirty :: Bool
   } deriving (Show)
 
-type TableId = Int
+type TableId = Word16
 
-type PageId = Int
+type PageId = Word32
 
 type PageMap = Map.Map (TableId, PageId) MemPage
 
@@ -65,8 +65,6 @@ type LockMap = Map.Map TableId L.Lock
 type TableMap = Map.Map TableId TableData
 
 type FieldSpecMap = Map.Map TableId FieldSpec
-
-type TxId = Int32
 
 data Tx = Tx
   { writtenPages :: Set (TableId, PageId)
@@ -107,7 +105,7 @@ newDB dataDir
       <*> Map.new
       <*> Map.new
       <*> newTVar False
-      <*> newTVar 0
+      <*> newTVar txIdMin
       <*> Map.new
 
 loadDB :: FilePath -> IO DB
@@ -243,7 +241,7 @@ alterPage DB {..} tableId pageId alter = do
             -- have not yet been stored to disk.
             when (pageId < 0 || pageCount tableHeader <= pageId) $
               throw $ InvalidPageId tableId pageId
-            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
+            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * (fromIntegral pageId)
             page <- runGet (getPage fieldSpec) <$> B.hGet handle pageSize >>= either (throw . PageDecodeError tableId pageId) return
             -- TODO: evict once page size reaches map limit
             let
@@ -342,7 +340,7 @@ flushDB DB {..} = do
             hSeek handle AbsoluteSeek 0
             B.hPut handle (encode tableHeader)
           forM_ pages $ \((_, pageId), MemPage {..}) -> do
-            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * pageId
+            hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * (fromIntegral pageId)
             B.hPut handle . runPut . putPage $ page
           hFlush handle
 
