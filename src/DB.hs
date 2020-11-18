@@ -263,6 +263,14 @@ alterPage DB {..} tableId pageId alter = do
         Nothing ->
           return Nothing
 
+fetchPage
+  :: DB
+  -> TableId
+  -> PageId
+  -> IO MemPage
+fetchPage db tableId pageId
+  = alterPage db tableId pageId id
+
 createPage :: DB -> TableId -> STM PageId
 createPage DB {..} tableId = do
   tableData@TableData {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
@@ -388,10 +396,27 @@ rollbackTx db@DB {..} txId = do
           | otherwise
               = (row : rows, pageModified)
 
--- -- Scan table, returning rows visible to the current transaction
--- scanTable :: DB -> TxId -> TableId -> IO [Row]
--- scanTable
---   = undefined
+-- Scan table, returning rows visible to the current transaction
+scanTable :: DB -> TxId -> TableId -> IO [Row]
+scanTable db@DB {..} txId tableId = do
+  (pageCount, activeTxIds) <- atomically $ do
+    TableHeader {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) (return . tableHeader)
+    -- TODO: consider use of IntSet here
+    activeTxIds <- fmap (Set.fromList . map fst) . toReverseList . Map.listT $ txMap
+    return (pageCount, activeTxIds)
+  -- TODO: iterate over pages in memory first to prevent churn
+  fmap concat . sequence $ (flip map) [0 .. pageCount - 1] $ \pageId -> do
+    MemPage Page {..} _ <- fetchPage db tableId pageId
+    return $ filter (isRowVisible activeTxIds) rows
+  where
+    isRowVisible :: Set TxId -> Row -> Bool
+    isRowVisible activeTxIds Row {..}
+      = isVisible tmin && not (maybe False isVisible tmax)
+      where
+        -- Determine if a transaction's action is visible to the
+        -- current transaction
+        isVisible tx
+          = tx == txId || tx < txId && not (Set.member tx activeTxIds)
 
 -- -- Visit pages, starting with those in memory, writing rows to free
 -- -- space in pages. When filter function provided, scan page and mark
