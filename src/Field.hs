@@ -43,3 +43,18 @@ type FieldSpec = [FieldType]
 fieldSpecSize :: FieldSpec -> Int
 fieldSpecSize
   = sum . map fieldTypeSize
+
+validateFields :: FieldSpec -> [Field] -> Bool
+validateFields [] []
+  = True
+validateFields (spec : specs) (field : fields)
+  = validateField spec field && validateFields specs fields
+  where
+    validateField FieldTypeBool (FieldBool _)
+      = True
+    validateField FieldTypeInt32 (FieldInt32 _)
+      = True
+    validateField _ _
+      = False
+validateFields _ _
+  = False
