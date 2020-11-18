@@ -7,9 +7,9 @@ import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush, hClose)
 import Data.Serialize (Serialize (..), decode, encode, runGet, runPut)
 import GHC.Generics (Generic)
-import Control.Exception (Exception, throw)
+import Control.Exception (Exception, throwIO)
 import Data.Typeable (Typeable)
-import Control.Monad (when, forM_, forM)
+import Control.Monad (when, forM_, forM, void)
 import ListT (toReverseList)
 import Data.List (sortBy, groupBy)
 import Data.Ord (comparing)
@@ -18,8 +18,9 @@ import Data.Maybe (catMaybes)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32)
-import Page (Page (..), Row (..), newPage, pageSize, getPage, putPage, TxId, txIdMin)
-import Field (FieldSpec)
+import Control.Arrow ((***))
+import Page (Page (..), PageHeader (..), Row (..), newPage, pageSize, getPage, putPage, TxId, txIdMin, rowSize)
+import Field (FieldSpec, Field, validateFields)
 
 data DBException
   = PageDecodeError TableId PageId String
@@ -29,6 +30,7 @@ data DBException
   | MissingFieldSpec TableId
   | DBInitError FilePath
   | InvalidTx TxId
+  | InvalidRow FieldSpec [Field]
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -115,8 +117,8 @@ loadDB dataDir = do
       = tableCounterFileName dataDir
     fieldSpecMapFile
       = fieldSpecMapFileName dataDir
-  tableCounter <- B.readFile tableCounterFile >>= either (throw $ DBInitError tableCounterFile) return . decode
-  fieldSpecList :: [(TableId, FieldSpec)] <- B.readFile fieldSpecMapFile >>= either (throw $ DBInitError fieldSpecMapFile) return . decode
+  tableCounter <- B.readFile tableCounterFile >>= either (\_ -> throwIO $ DBInitError tableCounterFile) return . decode
+  fieldSpecList :: [(TableId, FieldSpec)] <- B.readFile fieldSpecMapFile >>= either (\_ -> throwIO $ DBInitError fieldSpecMapFile) return . decode
   -- ^ TODO: load tx counter
   atomically $ do
     fieldSpecMap <- Map.new
@@ -165,7 +167,7 @@ openTable DB {..} tableId = do
         header <- decode <$> B.hGet handle tableHeaderSize
         case header of
           Left err ->
-            throw $ TableHeaderDecodeError tableId err
+            throwIO $ TableHeaderDecodeError tableId err
           Right header' -> do
             let
               tableData
@@ -240,9 +242,9 @@ alterPage DB {..} tableId pageId alter = do
             -- load, because some pages may exist in the page map but
             -- have not yet been stored to disk.
             when (pageId < 0 || pageCount tableHeader <= pageId) $
-              throw $ InvalidPageId tableId pageId
+              throwIO $ InvalidPageId tableId pageId
             hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * (fromIntegral pageId)
-            page <- runGet (getPage fieldSpec) <$> B.hGet handle pageSize >>= either (throw . PageDecodeError tableId pageId) return
+            page <- runGet (getPage fieldSpec) <$> B.hGet handle pageSize >>= either (throwIO . PageDecodeError tableId pageId) return
             -- TODO: evict once page size reaches map limit
             let
               memPage
@@ -271,8 +273,13 @@ fetchPage
 fetchPage db tableId pageId
   = alterPage db tableId pageId id
 
-createPage :: DB -> TableId -> STM PageId
-createPage DB {..} tableId = do
+createPage
+  :: DB
+  -> TableId
+  -> [Row] -- ^ Initial rows to populate
+  -> Int -- ^ Initial size of populated rows
+  -> STM PageId
+createPage DB {..} tableId rows pageSize = do
   tableData@TableData {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
   let
     pageId
@@ -280,7 +287,7 @@ createPage DB {..} tableId = do
     updatedTableData
       = tableData {tableHeader = TableHeader $ pageId + 1}
   Map.insert updatedTableData tableId tableMap
-  Map.insert (MemPage newPage True) (tableId, pageId) pageMap
+  Map.insert (MemPage (Page (PageHeader pageSize) rows) True) (tableId, pageId) pageMap
   return pageId
 
 tableCounterFileName
@@ -417,6 +424,46 @@ scanTable db@DB {..} txId tableId = do
         -- current transaction
         isVisible tx
           = tx == txId || tx < txId && not (Set.member tx activeTxIds)
+
+insertRows :: DB -> TxId -> TableId -> [[Field]] -> IO ()
+insertRows db@DB {..} txId tableId rows = do
+  (pageCount, fieldSpec) <- atomically $ do
+    TableHeader {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) (return . tableHeader)
+    fieldSpec <- Map.lookup tableId fieldSpecMap >>= maybe (throwSTM $ MissingFieldSpec tableId) return
+    return (pageCount, fieldSpec)
+
+  -- TODO: iterate over pages in memory first to prevent churn
+  helper fieldSpec [0 .. pageCount - 1] rows
+  where
+    helper _ _ []
+      = return ()
+
+    helper fieldSpec [] rows = do
+      -- Create pages and insert remaining rows
+      createHelper rows
+      where
+        size
+          = rowSize fieldSpec
+
+        createHelper []
+          = return ()
+        createHelper rows = do
+          rows' <- forM currentRows $ \fields -> do
+            if validateFields fieldSpec fields
+              then
+                return $ Row txId Nothing fields
+              else
+                throwIO $ InvalidRow fieldSpec fields
+          atomically $ createPage db tableId rows' (length currentRows * size)
+          createHelper nextRows
+          where
+            (currentRows, nextRows)
+              = (map snd *** map snd) . span ((<= pageSize) . fst) $ zip (scanl1 (+) (repeat size)) rows
+
+    helper fieldSpec (pageId : pageIds) rows = do
+      -- If empty space, add to page if possible. Then recurse on next
+      -- pages and remaining rows
+      undefined
 
 -- -- Visit pages, starting with those in memory, writing rows to free
 -- -- space in pages. When filter function provided, scan page and mark
