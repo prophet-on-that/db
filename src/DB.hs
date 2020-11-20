@@ -211,7 +211,7 @@ alterPage
   -> TableId
   -> PageId
   -> (MemPage -> MemPage) -- ^ Function to modify page
-  -> IO MemPage -- ^ Returns the modified page
+  -> IO (MemPage, MemPage) -- ^ Returns (original page, modified page)
 alterPage DB {..} tableId pageId alter = do
   pageOrLock <- atomically $ do
     page <- alterPage'
@@ -248,11 +248,13 @@ alterPage DB {..} tableId pageId alter = do
             -- TODO: evict once page size reaches map limit
             let
               memPage
-                = alter $ MemPage page False
-            atomically $ Map.insert memPage (tableId, pageId) pageMap
-            return memPage
+                = MemPage page False
+              newMemPage
+                = alter memPage
+            atomically $ Map.insert newMemPage (tableId, pageId) pageMap
+            return (memPage, newMemPage)
   where
-    alterPage' :: STM (Maybe MemPage)
+    alterPage' :: STM (Maybe (MemPage, MemPage))
     alterPage' = do
       page <- Map.lookup (tableId, pageId) pageMap
       case page of
@@ -261,7 +263,7 @@ alterPage DB {..} tableId pageId alter = do
             newPage
               = alter page'
           Map.insert newPage (tableId, pageId) pageMap
-          return $ Just newPage
+          return $ Just (page', newPage)
         Nothing ->
           return Nothing
 
@@ -271,7 +273,7 @@ fetchPage
   -> PageId
   -> IO MemPage
 fetchPage db tableId pageId
-  = alterPage db tableId pageId id
+  = snd <$> alterPage db tableId pageId id
 
 createPage
   :: DB
