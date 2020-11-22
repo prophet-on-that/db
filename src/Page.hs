@@ -1,10 +1,9 @@
 module Page where
 
-import GHC.Generics (Generic)
 import qualified Data.ByteString as B
 import Data.Serialize (Serialize (..), putByteString, Get, Putter)
 import Field (Field, FieldSpec, getField, fieldSpecSize, putField)
-import Data.Word (Word32)
+import Data.Word (Word16, Word32)
 
 type TxId = Word32
 
@@ -22,8 +21,8 @@ data Row = Row
   , fields :: [Field]
   } deriving (Show)
 
-rowSize :: FieldSpec -> Int
-rowSize
+getRowSize :: FieldSpec -> Word16
+getRowSize
   = (8 +) . fieldSpecSize
 
 getTmax :: Get (Maybe TxId)
@@ -49,55 +48,47 @@ putRow Row {..} = do
   putTmax tmax
   mapM_ putField fields
 
-getRows :: Int -> FieldSpec -> Get [Row]
+getRows :: Word16 -> FieldSpec -> Get [Row]
 getRows usedSpace fieldSpec
   = helper 0
   where
     helper countParsed
-      | usedSpace == rowSize fieldSpec * countParsed
+      | usedSpace == getRowSize fieldSpec * countParsed
           = return []
-      | usedSpace < rowSize fieldSpec * countParsed
-          = fail $  "Mismatch between parsed rows and reported space usage (usedSpace: " ++ show usedSpace ++ ", countParsed: " ++ show countParsed ++ ", rowSize: " ++ show (rowSize fieldSpec) ++ ")"
+      | usedSpace < getRowSize fieldSpec * countParsed
+          = fail $  "Mismatch between parsed rows and reported space usage (usedSpace: " ++ show usedSpace ++ ", countParsed: " ++ show countParsed ++ ", rowSize: " ++ show (getRowSize fieldSpec) ++ ")"
       | otherwise = do
           row <- getRow fieldSpec
           rows <- helper (countParsed + 1)
           return $ row : rows
 
-data PageHeader = PageHeader
-  { usedSpace :: Int
-  } deriving (Show, Generic)
-
-instance Serialize PageHeader
-
 data Page = Page
-  { pageHeader :: PageHeader
+  { usedSpace :: Word16
   , rows :: [Row]
   } deriving (Show)
 
 -- ^ The size of a table page in bytes, including its header
-pageSize :: Int
+pageSize :: Word16
 pageSize
   = 1024
 
+pageHeaderSize :: Word16
 pageHeaderSize
-  = 8
+  = 2
 
-pageDataSize :: Int
-pageDataSize
+-- ^ The available data space of a space
+pageSpace :: Word16
+pageSpace
   = pageSize - pageHeaderSize
-
-newPage :: Page
-newPage
-  = Page (PageHeader 0) []
 
 getPage :: FieldSpec -> Get Page
 getPage fieldSpec = do
-  pageHeader@PageHeader {..} <- get
+  usedSpace <- get
   rows <- getRows usedSpace fieldSpec
-  return $ Page pageHeader rows
+  return $ Page usedSpace rows
 
 putPage :: Putter Page
 putPage Page {..} = do
-  put pageHeader
+  put usedSpace
   mapM_ putRow rows
-  putByteString $ B.replicate (pageDataSize - usedSpace pageHeader) 0
+  putByteString $ B.replicate (fromIntegral $ pageSpace - usedSpace) 0

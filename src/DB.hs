@@ -7,9 +7,9 @@ import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush, hClose)
 import Data.Serialize (Serialize (..), decode, encode, runGet, runPut)
 import GHC.Generics (Generic)
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, throwIO, bracket)
 import Data.Typeable (Typeable)
-import Control.Monad (when, forM_, forM, void)
+import Control.Monad (when, forM_, forM)
 import ListT (toReverseList)
 import Data.List (sortBy, groupBy)
 import Data.Ord (comparing)
@@ -19,8 +19,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32)
 import Control.Arrow ((***))
-import Page (Page (..), PageHeader (..), Row (..), newPage, pageSize, getPage, putPage, TxId, txIdMin, rowSize)
-import Field (FieldSpec, Field, validateFields)
+import Page (Page (..), Row (..), pageSize, getPage, putPage, TxId, txIdMin, getRowSize, pageSpace)
+import Field (FieldSpec, Field (..), FieldType (..), validateFields)
 
 data DBException
   = PageDecodeError TableId PageId String
@@ -42,6 +42,7 @@ data TableHeader = TableHeader
 instance Serialize TableHeader
 
 -- ^ Size of table header in bytes
+tableHeaderSize :: Word16
 tableHeaderSize
   = 8
 
@@ -91,9 +92,44 @@ data DB = DB
   , txMap :: TxMap
   }
 
+printDB :: DB -> IO ()
+printDB DB {..} = do
+  (tableCounter', tableCounterHasChanged', tables, fieldSpecs, fieldSpecMapHasChanged, txCounter', txs) <- atomically $ (,,,,,,) <$>
+    readTVar tableCounter <*>
+    readTVar tableCounterHasChanged <*>
+    (toReverseList . Map.listT) tableMap <*>
+    (toReverseList . Map.listT) fieldSpecMap <*>
+    readTVar fieldSpecMapHasChanged <*>
+    readTVar txCounter <*>
+    (toReverseList . Map.listT) txMap
+
+  putStrLn $ "Table counter: " ++ show tableCounter' ++ "\tunsaved changes: " ++ show tableCounterHasChanged'
+
+  when (not $ null fieldSpecs) $
+    putStrLn "\nTable definitions:"
+  forM_ fieldSpecs $ \(tableId, fieldSpec) ->
+    putStrLn $ show tableId ++ "\t" ++ show fieldSpec
+
+  when (not $ null tables) $
+    putStrLn "\nLoaded tables:"
+  forM_ tables $ \(tableId, TableData {..}) ->
+    putStrLn $ show tableId ++ "\tpage count: " ++ (show . pageCount) tableHeader ++ "\tdirty header: " ++ show dirtyHeader
+
+  putStrLn $ "\nField spec map unsaved changes: " ++ show fieldSpecMapHasChanged
+
+  putStrLn $ "\nTransaction counter: " ++ show txCounter'
+
+  when (not $ null txs) $
+    putStrLn "\nOpen transactions:"
+  forM_ txs $ \(tableId, Tx {..}) ->
+    putStrLn $ show tableId ++ "\twritten pages: " ++ show writtenPages
+
+
 defaultDataDir
   = "tmp"
 
+-- TODO: create directory and fail if it already exists (to not
+-- overwrite anything)
 newDB
   :: FilePath -- ^ NOTE: this directory must exist!
   -> IO DB
@@ -164,7 +200,7 @@ openTable DB {..} tableId = do
       Nothing -> do
         handle <- openBinaryFile (getTableFileName dataDir tableId) ReadWriteMode
         -- TOOD: set buffer mode of handle
-        header <- decode <$> B.hGet handle tableHeaderSize
+        header <- fmap decode . B.hGet handle . fromIntegral $ tableHeaderSize
         case header of
           Left err ->
             throwIO $ TableHeaderDecodeError tableId err
@@ -179,6 +215,7 @@ openTable DB {..} tableId = do
 
 -- Create a table by opening file handle. Does not write table header
 -- to disk.
+-- TODO: throw error if field spec size greater than page space
 createTable :: DB -> FieldSpec -> IO (TableId, TableData)
 createTable DB {..} fieldSpec = do
   (tableId, lock) <- atomically $ do
@@ -210,9 +247,9 @@ alterPage
   :: DB
   -> TableId
   -> PageId
-  -> (MemPage -> MemPage) -- ^ Function to modify page
-  -> IO (MemPage, MemPage) -- ^ Returns (original page, modified page)
-alterPage DB {..} tableId pageId alter = do
+  -> (MemPage -> STM (MemPage, a)) -- ^ Function to modify page and return result
+  -> IO (MemPage, a) -- ^ Returns result of modify function
+alterPage DB {..} tableId pageId modPage = do
   pageOrLock <- atomically $ do
     page <- alterPage'
     case page of
@@ -244,26 +281,24 @@ alterPage DB {..} tableId pageId alter = do
             when (pageId < 0 || pageCount tableHeader <= pageId) $
               throwIO $ InvalidPageId tableId pageId
             hSeek handle AbsoluteSeek . toInteger $ tableHeaderSize + pageSize * (fromIntegral pageId)
-            page <- runGet (getPage fieldSpec) <$> B.hGet handle pageSize >>= either (throwIO . PageDecodeError tableId pageId) return
+            page <- runGet (getPage fieldSpec) <$> B.hGet handle (fromIntegral pageSize) >>= either (throwIO . PageDecodeError tableId pageId) return
             -- TODO: evict once page size reaches map limit
             let
               memPage
                 = MemPage page False
-              newMemPage
-                = alter memPage
-            atomically $ Map.insert newMemPage (tableId, pageId) pageMap
-            return (memPage, newMemPage)
+
+            atomically $ do
+              ret@(newMemPage, _) <- modPage memPage
+              Map.insert newMemPage (tableId, pageId) pageMap
+              return ret
   where
-    alterPage' :: STM (Maybe (MemPage, MemPage))
     alterPage' = do
-      page <- Map.lookup (tableId, pageId) pageMap
-      case page of
-        Just page' -> do
-          let
-            newPage
-              = alter page'
-          Map.insert newPage (tableId, pageId) pageMap
-          return $ Just (page', newPage)
+      memPage <- Map.lookup (tableId, pageId) pageMap
+      case memPage of
+        Just memPage' -> do
+          ret@(newMemPage, _) <- modPage memPage'
+          Map.insert newMemPage (tableId, pageId) pageMap
+          return $ Just ret
         Nothing ->
           return Nothing
 
@@ -273,23 +308,23 @@ fetchPage
   -> PageId
   -> IO MemPage
 fetchPage db tableId pageId
-  = snd <$> alterPage db tableId pageId id
+  = fst <$> alterPage db tableId pageId (return . (,()))
 
 createPage
   :: DB
   -> TableId
   -> [Row] -- ^ Initial rows to populate
-  -> Int -- ^ Initial size of populated rows
+  -> Word16 -- ^ Initial size of populated rows
   -> STM PageId
-createPage DB {..} tableId rows pageSize = do
+createPage DB {..} tableId rows usedSpace = do
   tableData@TableData {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) return
   let
     pageId
       = pageCount tableHeader
     updatedTableData
-      = tableData {tableHeader = TableHeader $ pageId + 1}
+      = tableData {tableHeader = TableHeader $ pageId + 1, dirtyHeader = True}
   Map.insert updatedTableData tableId tableMap
-  Map.insert (MemPage (Page (PageHeader pageSize) rows) True) (tableId, pageId) pageMap
+  Map.insert (MemPage (Page usedSpace rows) True) (tableId, pageId) pageMap
   return pageId
 
 tableCounterFileName
@@ -391,8 +426,8 @@ rollbackTx db@DB {..} txId = do
   forM_ (Set.toList writtenPages) $ \(tableId, pageId) -> do
     alterPage db tableId pageId rollbackPage
   where
-    rollbackPage (MemPage Page {..} isDirty)
-      = MemPage (Page pageHeader rows') (pageModified || isDirty)
+    rollbackPage (MemPage Page {..} isDirty) = do
+      return . (,()) $ MemPage (Page usedSpace rows') (pageModified || isDirty)
       where
         (rows', pageModified)
           = foldr helper ([], False) rows
@@ -427,15 +462,24 @@ scanTable db@DB {..} txId tableId = do
         isVisible tx
           = tx == txId || tx < txId && not (Set.member tx activeTxIds)
 
+splitRows
+  :: Word16 -- ^ Free space in page
+  -> Word16 -- ^ Size per row
+  -> [[Field]]
+  -> ([[Field]], [[Field]])
+splitRows freeSpace rowSize
+  = (map snd *** map snd) . span ((<= freeSpace) . fst) . zip (scanl1 (+) (repeat rowSize))
+
 insertRows :: DB -> TxId -> TableId -> [[Field]] -> IO ()
 insertRows db@DB {..} txId tableId rows = do
   (pageCount, fieldSpec) <- atomically $ do
     TableHeader {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) (return . tableHeader)
     fieldSpec <- Map.lookup tableId fieldSpecMap >>= maybe (throwSTM $ MissingFieldSpec tableId) return
     return (pageCount, fieldSpec)
-
-  -- TODO: iterate over pages in memory first to prevent churn
-  helper fieldSpec [0 .. pageCount - 1] rows
+  let
+    pages
+      = if pageCount > 0 then [0 .. pageCount - 1] else []
+  helper fieldSpec pages rows
   where
     helper _ _ []
       = return ()
@@ -444,8 +488,8 @@ insertRows db@DB {..} txId tableId rows = do
       -- Create pages and insert remaining rows
       createHelper rows
       where
-        size
-          = rowSize fieldSpec
+        rowSize
+          = getRowSize fieldSpec
 
         createHelper []
           = return ()
@@ -456,16 +500,44 @@ insertRows db@DB {..} txId tableId rows = do
                 return $ Row txId Nothing fields
               else
                 throwIO $ InvalidRow fieldSpec fields
-          atomically $ createPage db tableId rows' (length currentRows * size)
+          atomically $ createPage db tableId rows' ((fromIntegral . length) currentRows * rowSize)
           createHelper nextRows
           where
             (currentRows, nextRows)
-              = (map snd *** map snd) . span ((<= pageSize) . fst) $ zip (scanl1 (+) (repeat size)) rows
+              = splitRows pageSpace rowSize rows
 
     helper fieldSpec (pageId : pageIds) rows = do
       -- If empty space, add to page if possible. Then recurse on next
       -- pages and remaining rows
-      undefined
+      (_, nextRows) <- alterPage db tableId pageId modPage
+      helper fieldSpec pageIds nextRows
+      where
+        rowSize
+          = getRowSize fieldSpec
+        modPage memPage@(MemPage (Page usedSpace pageRows) _) = do
+          let
+            freeSpace
+              = pageSpace - usedSpace
+            (currentRows, nextRows)
+              = splitRows freeSpace rowSize rows
+          if null currentRows
+            then
+              return (memPage, nextRows)
+            else do
+              currentRows' <- forM currentRows $ \fields -> do
+                if validateFields fieldSpec fields
+                  then
+                    return $ Row txId Nothing fields
+                  else
+                    throwSTM $ InvalidRow fieldSpec fields
+              let
+                newUsedSpace
+                  = pageSpace + (fromIntegral . length) currentRows * rowSize
+                newPage
+                  = Page newUsedSpace (pageRows ++ currentRows')
+                newMemPage
+                  = MemPage newPage True
+              return (newMemPage, nextRows)
 
 -- -- Visit pages, starting with those in memory, writing rows to free
 -- -- space in pages. When filter function provided, scan page and mark

@@ -2,6 +2,7 @@ module Field where
 
 import Data.Serialize (Get, Serialize (..), Putter)
 import Data.Int (Int32)
+import Data.Word (Word16)
 import GHC.Generics (Generic)
 
 data Field
@@ -21,12 +22,12 @@ putField (FieldInt32 n)
 data FieldType
   = FieldTypeBool
   | FieldTypeInt32
-  deriving (Show, Generic)
+  deriving (Eq, Show, Generic)
 
 instance Serialize FieldType
 
 -- Byte size of each field
-fieldTypeSize :: FieldType -> Int
+fieldTypeSize :: FieldType -> Word16
 fieldTypeSize FieldTypeBool
   = 1
 fieldTypeSize FieldTypeInt32
@@ -40,7 +41,7 @@ getField FieldTypeInt32
 
 type FieldSpec = [FieldType]
 
-fieldSpecSize :: FieldSpec -> Int
+fieldSpecSize :: FieldSpec -> Word16
 fieldSpecSize
   = sum . map fieldTypeSize
 
