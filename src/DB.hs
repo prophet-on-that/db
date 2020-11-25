@@ -7,7 +7,7 @@ import GHC.Conc (atomically, TVar, newTVar, readTVar, writeTVar, throwSTM, STM)
 import System.IO (Handle, openBinaryFile, IOMode(..), hSeek, SeekMode(..), hFlush, hClose)
 import Data.Serialize (Serialize (..), decode, encode, runGet, runPut)
 import GHC.Generics (Generic)
-import Control.Exception (Exception, throwIO, bracket)
+import Control.Exception (Exception, throwIO)
 import Data.Typeable (Typeable)
 import Control.Monad (when, forM_, forM)
 import ListT (toReverseList)
@@ -20,7 +20,7 @@ import qualified Data.Set as Set
 import Data.Word (Word16, Word32)
 import Control.Arrow ((***))
 import Page (Page (..), Row (..), pageSize, getPage, putPage, TxId, txIdMin, getRowSize, pageSpace)
-import Field (FieldSpec, Field (..), FieldType (..), validateFields)
+import Field (FieldSpec, Field (..), validateFields)
 
 data DBException
   = PageDecodeError TableId PageId String
