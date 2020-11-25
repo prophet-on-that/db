@@ -10,6 +10,7 @@ import Data.Maybe (isJust)
 import Control.Monad (forM_)
 import Data.Serialize (encode, runPut)
 import qualified Data.ByteString as B
+import qualified Data.Set as Set
 import Page
 import Field
 import DB
@@ -98,6 +99,13 @@ tests
 
       , TestLabel "pageSize" . TestCase $ do
           fromIntegral pageSize @=? (B.length . runPut . putPage) (Page 0 [])
+
+      , testCase "beginTx" $ \db@DB {..} -> do
+          txId <- atomically $ beginTx db
+          txIdMin @=? txId
+          (atomically . readTVar) txCounter >>= assertEqual "txCounter" (txIdMin + 1)
+          Just Tx {..} <- atomically $ Map.lookup txId txMap
+          Set.empty @=? writtenPages
       ]
 
 run
