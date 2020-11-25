@@ -44,7 +44,7 @@ instance Serialize TableHeader
 -- ^ Size of table header in bytes
 tableHeaderSize :: Word16
 tableHeaderSize
-  = 8
+  = 4
 
 data TableData = TableData
   { tableHeader :: TableHeader
