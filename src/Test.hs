@@ -8,6 +8,8 @@ import Control.Exception (bracket)
 import qualified StmContainers.Map as Map
 import Data.Maybe (isJust)
 import Control.Monad (forM_)
+import Data.Serialize (encode, runPut)
+import qualified Data.ByteString as B
 import Page
 import Field
 import DB
@@ -73,6 +75,29 @@ tests
           forM_ (zip tableIds fieldSpecs) $ \(tableId, fieldSpec) -> do
             Just fieldSpec' <- atomically $ Map.lookup tableId fieldSpecMap
             fieldSpec @=? fieldSpec'
+
+      , testCase "createPage -- create single page" $ \db@DB {..} -> do
+          let
+            fieldSpec
+              = [FieldTypeInt32]
+          tableId <- fst <$> createTable db fieldSpec
+          pageId <- atomically $ createPage db tableId [] 0
+          Just TableData {..} <- atomically $ Map.lookup tableId tableMap
+          True @=? dirtyHeader
+          let
+            TableHeader {..}
+              = tableHeader
+          1 @=? pageCount
+          Just (MemPage Page {..} isDirty) <- atomically $ Map.lookup (tableId, pageId) pageMap
+          True @=? isDirty
+          0 @=? usedSpace
+          [] @=? rows
+
+      , TestLabel "tableHeaderSize" . TestCase $ do
+          fromIntegral tableHeaderSize @=? (B.length . encode) (TableHeader 0)
+
+      , TestLabel "pageSize" . TestCase $ do
+          fromIntegral pageSize @=? (B.length . runPut . putPage) (Page 0 [])
       ]
 
 run

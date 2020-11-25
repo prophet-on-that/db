@@ -19,7 +19,7 @@ data Row = Row
   { tmin :: TxId
   , tmax :: Maybe TxId
   , fields :: [Field]
-  } deriving (Show)
+  } deriving (Show, Eq)
 
 getRowSize :: FieldSpec -> Word16
 getRowSize
