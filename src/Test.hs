@@ -106,6 +106,51 @@ tests
           (atomically . readTVar) txCounter >>= assertEqual "txCounter" (txIdMin + 1)
           Just Tx {..} <- atomically $ Map.lookup txId txMap
           Set.empty @=? writtenPages
+
+      , testCase "insertRows -- insert single row into empty table" $ \db@DB {..} -> do
+          let
+            fieldSpec
+              = [FieldTypeBool]
+            rowData
+              = [[FieldBool True]]
+          tableId <- fst <$> createTable db fieldSpec
+          txId <- atomically $ beginTx db
+          insertRows db txId tableId rowData
+          -- Test page count is correct
+          Just (TableData TableHeader {..} _ _) <- atomically $ Map.lookup tableId tableMap
+          1 @=? pageCount
+          -- Test page contents
+          Just (MemPage Page {..} isDirty) <- atomically $ Map.lookup (tableId, 0) pageMap
+          True @=? isDirty
+          getRowSize fieldSpec @=? usedSpace
+          [Row txId Nothing (head rowData)] @=? rows
+
+      , testCase "insertRows -- two pages created in empty table" $ \db@DB {..} -> do
+          let
+            fieldSpec
+              = [FieldTypeBool]
+            rowSize
+              = getRowSize fieldSpec
+            rowCountPerPage
+              = pageSpace `div` rowSize
+            rowData
+              = replicate (1 + fromIntegral rowCountPerPage) [FieldBool True]
+          tableId <- fst <$> createTable db fieldSpec
+          txId <- atomically $ beginTx db
+          insertRows db txId tableId rowData
+          -- Test page count is correct
+          Just (TableData TableHeader {..} _ _) <- atomically $ Map.lookup tableId tableMap
+          2 @=? pageCount
+          -- Test first page contents
+          Just (MemPage Page {..} isDirty) <- atomically $ Map.lookup (tableId, 0) pageMap
+          True @=? isDirty
+          assertEqual "first page used space" usedSpace $ rowCountPerPage * rowSize
+          fromIntegral rowCountPerPage @=? length rows
+          -- Test second page contents
+          Just (MemPage Page {..} isDirty) <- atomically $ Map.lookup (tableId, 1) pageMap
+          True @=? isDirty
+          assertEqual "second page used space" usedSpace rowSize
+          1 @=? length rows
       ]
 
 run
