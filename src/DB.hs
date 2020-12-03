@@ -18,6 +18,7 @@ import Data.Maybe (catMaybes)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32)
+import Pipes
 import Control.Arrow ((***))
 import Page (Page (..), Row (..), pageSize, getPage, putPage, TxId, txIdMin, getRowSize, pageSpace)
 import Field (FieldSpec, Field (..), validateFields)
@@ -441,17 +442,17 @@ rollbackTx db@DB {..} txId = do
               = (row : rows, pageModified)
 
 -- Scan table, returning rows visible to the current transaction
-scanTable :: DB -> TxId -> TableId -> IO [Row]
+scanTable :: DB -> TxId -> TableId -> Producer Row IO ()
 scanTable db@DB {..} txId tableId = do
-  (pageCount, activeTxIds) <- atomically $ do
+  (pageCount, activeTxIds) <- lift . atomically $ do
     TableHeader {..} <- Map.lookup tableId tableMap >>= maybe (throwSTM $ TableNotOpen tableId) (return . tableHeader)
     -- TODO: consider use of IntSet here
     activeTxIds <- fmap (Set.fromList . map fst) . toReverseList . Map.listT $ txMap
     return (pageCount, activeTxIds)
   -- TODO: iterate over pages in memory first to prevent churn
-  fmap concat . sequence $ (flip map) [0 .. pageCount - 1] $ \pageId -> do
-    MemPage Page {..} _ <- fetchPage db tableId pageId
-    return $ filter (isRowVisible activeTxIds) rows
+  for (each [0 .. pageCount - 1]) $ \pageId -> do
+    MemPage Page {..} _ <- lift $ fetchPage db tableId pageId
+    for (each $ filter (isRowVisible activeTxIds) rows) yield
   where
     isRowVisible :: Set TxId -> Row -> Bool
     isRowVisible activeTxIds Row {..}
