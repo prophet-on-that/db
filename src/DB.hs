@@ -476,16 +476,16 @@ scanTable db@DB {..} txId tableId = do
   -- TODO: iterate over pages in memory first to prevent churn
   for (each [0 .. pageCount - 1]) $ \pageId -> do
     MemPage Page {..} _ <- lift $ fetchPage db tableId pageId
-    each $ filter (isRowVisible activeTxIds) rows
+    each $ filter (isRowVisible txId activeTxIds) rows
+
+isRowVisible :: TxId -> Set TxId -> Row -> Bool
+isRowVisible txId activeTxIds Row {..}
+  = isVisible tmin && not (maybe False isVisible tmax)
   where
-    isRowVisible :: Set TxId -> Row -> Bool
-    isRowVisible activeTxIds Row {..}
-      = isVisible tmin && not (maybe False isVisible tmax)
-      where
-        -- Determine if a transaction's action is visible to the
-        -- current transaction
-        isVisible tx
-          = tx == txId || tx < txId && not (Set.member tx activeTxIds)
+    -- Determine if a transaction's action is visible to the
+    -- current transaction
+    isVisible tx
+      = tx == txId || tx < txId && not (Set.member tx activeTxIds)
 
 splitRows
   :: Word16 -- ^ Free space in page
