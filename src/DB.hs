@@ -452,7 +452,7 @@ scanTable db@DB {..} txId tableId = do
   -- TODO: iterate over pages in memory first to prevent churn
   for (each [0 .. pageCount - 1]) $ \pageId -> do
     MemPage Page {..} _ <- lift $ fetchPage db tableId pageId
-    for (each $ filter (isRowVisible activeTxIds) rows) yield
+    each $ filter (isRowVisible activeTxIds) rows
   where
     isRowVisible :: Set TxId -> Row -> Bool
     isRowVisible activeTxIds Row {..}
