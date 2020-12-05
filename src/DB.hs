@@ -85,13 +85,12 @@ type TxMap = Map.Map TxId Tx
 
 data DB = DB
   { dataDir :: FilePath
+  , dbStateHasChanged :: TVar Bool
   , tableCounter :: TVar TableId
-  , tableCounterHasChanged :: TVar Bool
   , pageMap :: PageMap
   , lockMap :: LockMap
   , tableMap :: TableMap
   , fieldSpecMap :: FieldSpecMap
-  , fieldSpecMapHasChanged :: TVar Bool
   , txCounter :: TVar TxId
   , txMap :: TxMap
   }
@@ -105,15 +104,6 @@ data DBState = DBState
 
 instance Serialize DBState
 
-dbStateHasChanged :: DB -> STM Bool
-dbStateHasChanged DB {..}
-  = any id <$> mapM readTVar tvars
-  where
-    tvars
-      = [ tableCounterHasChanged
-        , fieldSpecMapHasChanged
-        ]
-
 getDBState :: DB -> STM DBState
 getDBState DB {..} = do
   DBState <$>
@@ -121,39 +111,6 @@ getDBState DB {..} = do
     (toReverseList . Map.listT) fieldSpecMap <*>
     readTVar txCounter <*>
     (toReverseList . Map.listT) txMap
-
-printDB :: DB -> IO ()
-printDB DB {..} = do
-  (tableCounter', tableCounterHasChanged', tables, fieldSpecs, fieldSpecMapHasChanged, txCounter', txs) <- atomically $ (,,,,,,) <$>
-    readTVar tableCounter <*>
-    readTVar tableCounterHasChanged <*>
-    (toReverseList . Map.listT) tableMap <*>
-    (toReverseList . Map.listT) fieldSpecMap <*>
-    readTVar fieldSpecMapHasChanged <*>
-    readTVar txCounter <*>
-    (toReverseList . Map.listT) txMap
-
-  putStrLn $ "Table counter: " ++ show tableCounter' ++ "\tunsaved changes: " ++ show tableCounterHasChanged'
-
-  when (not $ null fieldSpecs) $
-    putStrLn "\nTable definitions:"
-  forM_ fieldSpecs $ \(tableId, fieldSpec) ->
-    putStrLn $ show tableId ++ "\t" ++ show fieldSpec
-
-  when (not $ null tables) $
-    putStrLn "\nLoaded tables:"
-  forM_ tables $ \(tableId, TableData {..}) ->
-    putStrLn $ show tableId ++ "\tpage count: " ++ (show . pageCount) tableHeader ++ "\tdirty header: " ++ show dirtyHeader
-
-  putStrLn $ "\nField spec map unsaved changes: " ++ show fieldSpecMapHasChanged
-
-  putStrLn $ "\nTransaction counter: " ++ show txCounter'
-
-  when (not $ null txs) $
-    putStrLn "\nOpen transactions:"
-  forM_ txs $ \(tableId, Tx {..}) ->
-    putStrLn $ show tableId ++ "\twritten pages: " ++ show writtenPages
-
 
 defaultDataDir
   = "tmp"
@@ -166,13 +123,12 @@ newDB
 newDB dataDir
   = atomically $
           DB dataDir
-      <$> newTVar 0
-      <*> newTVar False
+      <$> newTVar False
+      <*> newTVar 0
       <*> Map.new
       <*> Map.new
       <*> Map.new
       <*> Map.new
-      <*> newTVar False
       <*> newTVar txIdMin
       <*> Map.new
 
@@ -187,13 +143,12 @@ loadDB dataDir = do
   let
     db
       = DB dataDir <$>
-          newTVar stateTableCounter <*>
           newTVar False <*>
+          newTVar stateTableCounter <*>
           Map.new <*>
           Map.new <*>
           Map.new <*>
           fromList stateFieldSpecMap <*>
-          newTVar False <*>
           newTVar stateTxCounter <*>
           fromList stateTxMap
   atomically db
@@ -263,9 +218,9 @@ createTable DB {..} fieldSpec = do
   (tableId, lock) <- atomically $ do
     tableId <- readTVar tableCounter
     writeTVar tableCounter $ tableId + 1
-    writeTVar tableCounterHasChanged True
+    writeTVar dbStateHasChanged True
     Map.insert fieldSpec tableId fieldSpecMap
-    writeTVar fieldSpecMapHasChanged True
+    writeTVar dbStateHasChanged True
     -- Create lock
     lock <- L.new
     Map.insert lock tableId lockMap
@@ -381,7 +336,7 @@ flushDB db@DB {..} = do
     forM_ pagesToFlush $ \(tableAndPageId, memPage) ->
       Map.insert (memPage {isDirty = False}) tableAndPageId pageMap
 
-    stateChange <- dbStateHasChanged db
+    stateChange <- readTVar dbStateHasChanged
     dbState <- if stateChange
       then
         Just <$> getDBState db
@@ -431,12 +386,14 @@ beginTx :: DB -> STM TxId
 beginTx DB {..} = do
   txId <- readTVar txCounter
   writeTVar txCounter (txId + 1)
+  writeTVar dbStateHasChanged True
   Map.insert newTx txId txMap
   return txId
 
 commitTx :: DB -> TxId -> STM ()
-commitTx DB {..} txId
-  = Map.delete txId txMap
+commitTx DB {..} txId = do
+  Map.delete txId txMap
+  writeTVar dbStateHasChanged True
 
 -- Undo all modifications by the transaction by looking at all pages
 -- touched by it
@@ -445,7 +402,11 @@ commitTx DB {..} txId
 --     it)
 rollbackTx :: DB -> TxId -> IO ()
 rollbackTx db@DB {..} txId = do
-  Tx {..} <- atomically $ Map.lookup txId txMap >>= maybe (throwSTM $ InvalidTx txId) return
+  Tx {..} <- atomically $ do
+    tx <- Map.lookup txId txMap >>= maybe (throwSTM $ InvalidTx txId) return
+    -- Remove transaction from txMap
+    commitTx db txId
+    return tx
   -- TODO: update first those pages in memory, to avoid page table
   -- churn
   forM_ (Set.toList writtenPages) $ \(tableId, pageId) -> do

@@ -38,12 +38,12 @@ tests
   = TestList
       [ testCase "newDB -- initial state" $ \DB {..} -> do
           (atomically . readTVar) tableCounter >>= assertEqual "table counter" 0
-          (atomically . readTVar) tableCounterHasChanged >>= assertEqual "table counter has changed" False
+          (atomically . readTVar) dbStateHasChanged >>= assertEqual "db state has changed" False
           (atomically . Map.size) pageMap >>= assertEqual "page map size" 0
           (atomically . Map.size) lockMap >>= assertEqual "lock map size" 0
           (atomically . Map.size) tableMap >>= assertEqual "table map size" 0
           (atomically . Map.size) fieldSpecMap >>= assertEqual "field spec map size" 0
-          (atomically . readTVar) fieldSpecMapHasChanged >>= assertEqual "field spec map has changed" False
+          (atomically . readTVar) dbStateHasChanged >>= assertEqual "db state has changed" False
           (atomically . readTVar) txCounter >>= assertEqual "tx counter" txIdMin
           (atomically . Map.size) txMap >>= assertEqual "tx map size" 0
 
@@ -54,13 +54,13 @@ tests
           (tableId, _) <- createTable db fieldSpec
           assertEqual "table id" 0 tableId
           (atomically . readTVar) tableCounter >>= assertEqual "table counter" 1
-          (atomically . readTVar) tableCounterHasChanged >>= assertEqual "table counter has changed" True
+          (atomically . readTVar) dbStateHasChanged >>= assertEqual "db state has changed" True
           Just TableData {..} <- atomically $ Map.lookup tableId tableMap
           assertEqual "table page count" 0 (pageCount tableHeader)
           assertEqual "table header is dirty" True dirtyHeader
           Just fieldSpec' <- atomically $ Map.lookup tableId fieldSpecMap
           assertEqual "" fieldSpec fieldSpec'
-          (atomically . readTVar) fieldSpecMapHasChanged >>= assertEqual "" True
+          (atomically . readTVar) dbStateHasChanged >>= assertEqual "" True
           lock <- atomically $ Map.lookup tableId lockMap
           assertBool "" $ isJust lock
 
