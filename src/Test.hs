@@ -151,6 +151,33 @@ tests
           True @=? isDirty
           assertEqual "second page used space" usedSpace rowSize
           1 @=? length rows
+
+      , testCase "insertRows -- insert into partial page" $ \db@DB {..} -> do
+          let
+            fieldSpec
+              = [FieldTypeBool]
+            rowSize
+              = getRowSize fieldSpec
+            rowCountPerPage
+              = pageSpace `div` rowSize
+          tableId <- fst <$> createTable db fieldSpec
+          txId <- atomically $ beginTx db
+          insertRows db txId tableId [[FieldBool True]]
+          insertRows db txId tableId $ replicate (fromIntegral rowCountPerPage) [FieldBool False]
+
+          -- Test page count is correct
+          Just (TableData TableHeader {..} _ _) <- atomically $ Map.lookup tableId tableMap
+          2 @=? pageCount
+          -- Test first page contents
+          Just (MemPage Page {..} isDirty) <- atomically $ Map.lookup (tableId, 0) pageMap
+          True @=? isDirty
+          assertEqual "first page used space" (rowCountPerPage * rowSize) usedSpace
+          fromIntegral rowCountPerPage @=? length rows
+          -- Test second page contents
+          Just (MemPage Page {..} isDirty) <- atomically $ Map.lookup (tableId, 1) pageMap
+          True @=? isDirty
+          assertEqual "second page used space" rowSize usedSpace
+          1 @=? length rows
       ]
 
 run
