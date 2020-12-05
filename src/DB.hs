@@ -533,7 +533,7 @@ insertRows db@DB {..} txId tableId rows = do
                     throwSTM $ InvalidRow fieldSpec fields
               let
                 newUsedSpace
-                  = pageSpace + (fromIntegral . length) currentRows * rowSize
+                  = usedSpace + (fromIntegral . length) currentRows * rowSize
                 newPage
                   = Page newUsedSpace (pageRows ++ currentRows')
                 newMemPage
