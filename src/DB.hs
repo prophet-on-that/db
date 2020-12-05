@@ -32,6 +32,7 @@ data DBException
   | DBInitError FilePath
   | InvalidTx TxId
   | InvalidRow FieldSpec [Field]
+  | ExistingTransactionError [(TxId, Tx)]
   deriving (Show, Typeable)
 
 instance Exception DBException
@@ -72,7 +73,9 @@ type FieldSpecMap = Map.Map TableId FieldSpec
 
 data Tx = Tx
   { writtenPages :: Set (TableId, PageId)
-  } deriving (Show)
+  } deriving (Show, Generic)
+
+instance Serialize Tx
 
 newTx :: Tx
 newTx
@@ -92,6 +95,32 @@ data DB = DB
   , txCounter :: TVar TxId
   , txMap :: TxMap
   }
+
+data DBState = DBState
+  { stateTableCounter :: TableId
+  , stateFieldSpecMap :: [(TableId, FieldSpec)]
+  , stateTxCounter :: TxId
+  , stateTxMap :: [(TxId, Tx)]  -- Active transactions
+  } deriving (Show, Generic)
+
+instance Serialize DBState
+
+dbStateHasChanged :: DB -> STM Bool
+dbStateHasChanged DB {..}
+  = any id <$> mapM readTVar tvars
+  where
+    tvars
+      = [ tableCounterHasChanged
+        , fieldSpecMapHasChanged
+        ]
+
+getDBState :: DB -> STM DBState
+getDBState DB {..} = do
+  DBState <$>
+    readTVar tableCounter <*>
+    (toReverseList . Map.listT) fieldSpecMap <*>
+    readTVar txCounter <*>
+    (toReverseList . Map.listT) txMap
 
 printDB :: DB -> IO ()
 printDB DB {..} = do
@@ -150,18 +179,30 @@ newDB dataDir
 loadDB :: FilePath -> IO DB
 loadDB dataDir = do
   let
-    tableCounterFile
-      = tableCounterFileName dataDir
-    fieldSpecMapFile
-      = fieldSpecMapFileName dataDir
-  tableCounter <- B.readFile tableCounterFile >>= either (\_ -> throwIO $ DBInitError tableCounterFile) return . decode
-  fieldSpecList :: [(TableId, FieldSpec)] <- B.readFile fieldSpecMapFile >>= either (\_ -> throwIO $ DBInitError fieldSpecMapFile) return . decode
-  -- ^ TODO: load tx counter
-  atomically $ do
-    fieldSpecMap <- Map.new
-    forM_ fieldSpecList $ \(tableId, fieldSpec) ->
-      Map.insert fieldSpec tableId fieldSpecMap
-    DB dataDir <$> newTVar tableCounter <*> newTVar False <*> Map.new <*> Map.new <*> Map.new <*> return fieldSpecMap <*> newTVar False <*> newTVar 0 <*> Map.new
+    dbStateFile
+      = dbStateFileName dataDir
+  DBState {..} <- B.readFile dbStateFile >>= either (\_ -> throwIO $ DBInitError dbStateFile) return . decode
+  when (not . null $ stateTxMap) $
+    throwIO $ ExistingTransactionError stateTxMap
+  let
+    db
+      = DB dataDir <$>
+          newTVar stateTableCounter <*>
+          newTVar False <*>
+          Map.new <*>
+          Map.new <*>
+          Map.new <*>
+          fromList stateFieldSpecMap <*>
+          newTVar False <*>
+          newTVar stateTxCounter <*>
+          fromList stateTxMap
+  atomically db
+  where
+    fromList xs = do
+      map <- Map.new
+      forM_ xs $ \(key, val) ->
+        Map.insert val key map
+      return map
 
 closeDB :: DB -> IO ()
 closeDB db@DB {..} = do
@@ -328,44 +369,30 @@ createPage DB {..} tableId rows usedSpace = do
   Map.insert (MemPage (Page usedSpace rows) True) (tableId, pageId) pageMap
   return pageId
 
-tableCounterFileName
-  = (++ "/tableCounter")
-
-fieldSpecMapFileName
-  = (++ "/fieldSpecMap")
+dbStateFileName
+  = (++ "/dbState")
 
 flushDB :: DB -> IO ()
-flushDB DB {..} = do
+flushDB db@DB {..} = do
   -- TODO: write tx counter
-  (pagesToFlush, tableCounter', fieldSpecMap') <- atomically $ do
+  (pagesToFlush, dbState) <- atomically $ do
     pagesToFlush <- fmap (filter $ isDirty . snd) . toReverseList . Map.listT $ pageMap
     -- Mark all affected pages as written
     forM_ pagesToFlush $ \(tableAndPageId, memPage) ->
       Map.insert (memPage {isDirty = False}) tableAndPageId pageMap
 
-    flushTableCounter <- readTVar tableCounterHasChanged
-    tableCounter' <- if flushTableCounter
-      then do
-        writeTVar tableCounterHasChanged False
-        Just <$> readTVar tableCounter
+    stateChange <- dbStateHasChanged db
+    dbState <- if stateChange
+      then
+        Just <$> getDBState db
       else
         return Nothing
-
-    flushFieldSpecMap <- readTVar fieldSpecMapHasChanged
-    fieldSpecMap' <- if flushFieldSpecMap
-      then do
-        writeTVar fieldSpecMapHasChanged False
-        fmap Just . toReverseList . Map.listT $  fieldSpecMap
-      else
-        return Nothing
-
-    return (pagesToFlush, tableCounter', fieldSpecMap')
+    return (pagesToFlush, dbState)
 
   flushPages pagesToFlush
-  -- TODO: the following operations should be locked to not execute
+  -- TODO: the following operation should be locked to not execute
   -- concurrently
-  maybe (return ()) flushTableCounter tableCounter'
-  maybe (return ()) flushFieldSpecMap fieldSpecMap'
+  maybe (return ()) flushDBState dbState
   where
     flushPages pagesToFlush = do
       let
@@ -397,11 +424,8 @@ flushDB DB {..} = do
             B.hPut handle . runPut . putPage $ page
           hFlush handle
 
-    flushTableCounter
-      = B.writeFile (tableCounterFileName dataDir) . encode
-
-    flushFieldSpecMap
-      = B.writeFile (fieldSpecMapFileName dataDir) . encode
+    flushDBState
+      = B.writeFile (dbStateFileName dataDir) . encode
 
 beginTx :: DB -> STM TxId
 beginTx DB {..} = do
